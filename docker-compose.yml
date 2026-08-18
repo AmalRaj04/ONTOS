@@ -1,0 +1,83 @@
+# ONTOS local stack: HydraDB (built from the vendored, unmodified AGPL-3.0 source —
+# run as a separate container, never linked into this repo, see BUILD-SPEC.md §2) + MinIO
+# as its S3-compatible object store, per BUILD-SPEC.md §3/§4.
+#
+# vendor/hydradb has no docker-compose.yml of its own (confirmed by inspection); this
+# file's HydraDB env vars are sourced from its Helm chart
+# (vendor/hydradb/charts/hydradb/templates/configmap.yaml) and its Dockerfile
+# (vendor/hydradb/Dockerfile, `runtime` target), translated to a single-node compose
+# setup. Day-to-day development instead runs graph-node natively with
+# CLOUD_PROVIDER=local (see docs/cypher-support.md and PROJECT.md decision #6) — this
+# compose file is the judge-facing / reproducible path described in the README.
+
+services:
+  minio:
+    image: minio/minio:latest
+    command: server /data --console-address ":9001"
+    environment:
+      MINIO_ROOT_USER: ontos-minio
+      MINIO_ROOT_PASSWORD: ontos-minio-secret
+    ports:
+      - "9000:9000"
+      - "9001:9001"
+    volumes:
+      - minio-data:/data
+    healthcheck:
+      test: ["CMD", "mc", "ready", "local"]
+      interval: 5s
+      timeout: 5s
+      retries: 12
+
+  minio-init:
+    image: minio/mc:latest
+    depends_on:
+      minio:
+        condition: service_healthy
+    entrypoint: >
+      /bin/sh -c "
+      mc alias set local http://minio:9000 ontos-minio ontos-minio-secret &&
+      mc mb -p local/ontos-graph &&
+      exit 0
+      "
+
+  hydradb:
+    build:
+      context: ./vendor/hydradb
+      target: runtime
+    depends_on:
+      minio-init:
+        condition: service_completed_successfully
+    ports:
+      - "7687:7687"
+      - "8443:8443"
+      - "9090:9090"
+    environment:
+      RUST_MIN_STACK: "33554432"
+      RUST_LOG: info
+      CLOUD_PROVIDER: aws
+      AWS_BUCKET_NAME: ontos-graph
+      AWS_DEFAULT_REGION: us-east-1
+      AWS_ALLOW_HTTP: "true"
+      AWS_ENDPOINT: http://minio:9000
+      AWS_ACCESS_KEY_ID: ontos-minio
+      AWS_SECRET_ACCESS_KEY: ontos-minio-secret
+      GRAPH_NAMESPACE: default
+      GRAPH_ID: default
+      GRAPH_DATABASE: default
+      GRAPH_CELL_ID: cell-0
+      GRAPH_CELLS: cell-0
+      GRAPH_DATA_PATH: ontos/data
+      GRAPH_DATA_CACHE_DIR: /var/cache/slatedb/data
+      GRAPH_NODE_ID: node-0
+      GRAPH_BOLT_ADDR: 0.0.0.0:7687
+      GRAPH_HTTP_ADDR: 0.0.0.0:8443
+      GRAPH_ADMIN_ADDR: 0.0.0.0:9090
+      GRAPH_ADVERTISED_BOLT_ADDR: 127.0.0.1:7687
+      GRAPH_BOLT_NODE_ADDRESSES: node-0=127.0.0.1:7687
+      GRAPH_AUTH_TOKEN_FILE: /run/secrets/hydradb-auth-token
+      GRAPH_ALLOW_PLAINTEXT: "true"
+    volumes:
+      - ./.hydradb/auth-token:/run/secrets/hydradb-auth-token:ro
+
+volumes:
+  minio-data:

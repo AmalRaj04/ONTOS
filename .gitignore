@@ -1,0 +1,21 @@
+.env
+.DS_Store
+
+# Reference clones only — never vendor/link into this Apache-2.0 repo (AGPL HydraDB,
+# 3.7GB EnterpriseRAG-Bench corpus). See BUILD-SPEC.md §2/§15.
+vendor/
+
+# Local runtime state / downloaded corpus subsets / HydraDB store+cache
+data/
+.hydradb/
+
+# Python
+__pycache__/
+*.pyc
+.venv/
+venv/
+
+# Checkpoints / caches produced by ingest, resolution, LLM router
+checkpoints/
+.cache/
+*.jsonl.checkpoint

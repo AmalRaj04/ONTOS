@@ -1,0 +1,9 @@
+neo4j>=5.0,<7.0
+pydantic>=2.0,<3.0
+google-genai
+groq
+datasketch
+networkx
+tqdm
+streamlit
+python-dotenv
