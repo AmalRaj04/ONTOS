@@ -1,0 +1,187 @@
+# ONTOS TBox — BUILD-SPEC.md §7.6. Frozen after M0.5.
+#
+# Scoped against competency questions (all 500 questions.jsonl + 100
+# extra_questions.jsonl) and the EnterpriseRAG-Bench generation scaffolding
+# (company_overview.md, initiatives.md, employee_directory.yaml, source_tree.txt,
+# project_list.txt), per §7.6.1/§7.6.2. Classes are exactly BUILD-SPEC.md §7.2's
+# frozen node labels (Person/Team/Project/Product/Customer/Ticket/Meeting/Thread) —
+# no new node labels invented. Relations start from the 10 predicates BUILD-SPEC.md
+# §8.4's own Tier-2 extraction prompt already names (OWNS, WORKS_ON, MEMBER_OF,
+# LAUNCH_DATE, STATUS, REPORTS_TO, DEADLINE, BLOCKS, PRICE, HEADCOUNT) and extend
+# only where the question set demonstrably needs more (PRIORITY, ATTENDED,
+# REVIEWED_BY, TIER, LINKED_TO) — see docs/tbox-validation.md for the coverage
+# check against all 600 questions.
+#
+# Scope note: most of the 600 questions are narrative/numeric facts embedded in
+# prose (a retention period, a latency threshold, an incident root cause) that a
+# TBox relation cannot usefully type — those are answered by chunk-level retrieval
+# and citation (LOOKUP over Document/Chunk), not a structured Claim triple. The
+# relations below cover the recurring, genuinely relational fact types: ownership/
+# assignment, org structure, status/priority/dates, membership, blocking, meeting
+# attendance, review, and cross-ticket linkage. Extending further would be
+# speculative cataloguing of the corpus, which §7.6.2 explicitly says not to do.
+
+classes:
+  Person:   {parent: null}
+  Team:     {parent: null}
+  Project:  {parent: null}
+  Product:  {parent: null}
+  Customer: {parent: null}
+  Ticket:   {parent: null}   # jira, linear, AND github PRs (tracker: jira|linear|github) —
+                              # bottom-up: github PR JSON shape (key-like pr_number, state,
+                              # reviewers) matches Ticket's {tracker, key, state} shape closely
+                              # enough that a second class would just duplicate it.
+  Meeting:  {parent: null}   # fireflies calls
+  Thread:   {parent: null}   # slack threads, gmail threads
+
+relations:
+  OWNS:
+    domain: Person
+    range: [Ticket, Project, Product, Customer]
+    functional: true
+    temporal: true
+    source_forms:
+      jira: [assignee, reporter]
+      linear: [assignee, creator]
+      hubspot: [owner, se_assigned]
+      google_drive: [owner]
+      fireflies: [redwood_owner]
+    inverse: OWNED_BY
+
+  WORKS_ON:
+    domain: Person
+    range: [Project]
+    functional: false
+    source_forms:
+      # no direct field — derived transitively via OWNS on a Ticket whose
+      # project matches, or extracted directly by Tier 2 from narrative text
+      # ("X is working on Y") when no structural signal exists.
+      derived: [ticket.project via OWNS]
+
+  MEMBER_OF:
+    domain: Person
+    range: [Team]
+    functional: false
+    source_forms:
+      scaffolding: [employee_directory.yaml departments]
+      confluence: [owner_team]
+      google_drive: [team]
+    inverse: HAS_MEMBER
+
+  REPORTS_TO:
+    domain: Person
+    range: Person
+    functional: true
+    temporal: true
+    source_forms:
+      scaffolding: [employee_directory.yaml manager]
+    inverse: MANAGES
+
+  LAUNCH_DATE:
+    domain: Project
+    range: literal(date)
+    functional: true
+    temporal: true
+    source_forms:
+      # no dedicated "projects" source file — projects are cross-referenced
+      # entities, not their own record type in the 9 sources (see project_list.txt,
+      # which is scaffolding, not a source system). Extracted by Tier 2 from
+      # narrative mentions across linear/confluence/gmail/fireflies.
+      narrative: [Tier 2 extraction only]
+
+  STATUS:
+    domain: [Ticket, Project, Customer]
+    range: literal(string)
+    functional: true
+    temporal: true
+    source_forms:
+      jira: [status]
+      linear: [status]
+      github: [state]
+      hubspot: [stage]
+      confluence: [status]
+      google_drive: [status]
+
+  DEADLINE:
+    domain: [Ticket, Project]
+    range: literal(date)
+    functional: true
+    temporal: true
+    source_forms:
+      jira: [sla_due_at, first_response_due_at]
+      linear: [due_date]
+      hubspot: [forecast_close_month]
+
+  BLOCKS:
+    domain: Ticket
+    range: [Ticket]
+    functional: false
+    source_forms:
+      jira: [linked_issues]
+      linear: [dependencies, parent_issue]
+    inverse: BLOCKED_BY
+
+  PRICE:
+    domain: [Product, Customer]
+    range: literal(string)
+    functional: true
+    temporal: true
+    source_forms:
+      hubspot: [estimated_arr_range]
+
+  HEADCOUNT:
+    domain: [Team, Customer]
+    range: literal(string)
+    functional: true
+    temporal: true
+    source_forms:
+      hubspot: [employee_count_range]
+      scaffolding: [employee_directory.yaml department size, company_overview.md team size]
+
+  PRIORITY:
+    domain: Ticket
+    range: literal(string)
+    functional: true
+    source_forms:
+      jira: [priority, severity]
+      linear: [priority]
+      hubspot: [sales_priority]
+
+  TIER:
+    domain: Customer
+    range: literal(string)
+    functional: true
+    temporal: true
+    source_forms:
+      hubspot: [account_tier]
+      jira: [customer_tier]
+
+  ATTENDED:
+    domain: Person
+    range: Meeting
+    functional: false
+    source_forms:
+      fireflies: [redwood_attendees, customer_attendees]
+
+  REVIEWED_BY:
+    domain: Ticket
+    range: Person
+    functional: false
+    source_forms:
+      github: [reviewers]
+      confluence: [reviewers]
+    inverse: REVIEWS
+
+  LINKED_TO:
+    domain: Ticket
+    range: [Ticket]
+    functional: false
+    source_forms:
+      jira: [related_github_prs, related_confluence_pages]
+      github: [linked_linear, linked_jira]
+    # Broader cross-document linkage (hubspot's linked_gmail_threads/
+    # linked_drive_docs/linked_fireflies/linked_support_tickets) is handled by
+    # the structural graph — shared Customer entity + Document provenance —
+    # not this relation, since Document is not a TBox class (it is the
+    # structural/provenance layer, §7.2). Encoding it here would require a
+    # typed range into a non-class node, which the frozen schema does not have.

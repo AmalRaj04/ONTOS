@@ -11,7 +11,7 @@ Deadline: **2026-08-21, 12:29 PM IST**.
 | Milestone | Status | Notes |
 |---|---|---|
 | M0 — Foundation | **done** | HydraDB running natively, round-trip verified, full P1-P7 probe run live, `docs/cypher-support.md` written, `src/schema/{models.py,ids.py}` committed, license present |
-| M0.5 — TBox frozen | not started | |
+| M0.5 — TBox frozen | **done** | `ontology/tbox.yaml` (8 classes, 15 relations) validated against all 600 questions (500+100), 0 vocabulary gaps; materialized as `:Class`/`:Relation` nodes, spot-checked live |
 | M1 — Walking skeleton | not started | |
 | M2 — Ingest depth | not started | |
 | M3 — Entity resolution | not started | |
@@ -116,6 +116,37 @@ prose, per the spec's own §0 rule. Each entry: what, why, where it's applied.
     scripts/{answer_evaluation/metrics_based_eval.py,
     answer_generation/bm25_retrieval.py}`. M6 adapts these instead of writing
     scoring logic from scratch.
+16. **TBox validated against all 600 questions (500 + 100 extra), not just a
+    50-question spot-check** — 0 vocabulary gaps. Full method and results in
+    `docs/tbox-validation.md`. Two class-modeling calls worth remembering:
+    **GitHub PRs are `Ticket`s** (`tracker: github`), not a new `PullRequest`
+    class — their JSON shape (`pr_number, state, reviewers, merge_outcome`)
+    matches `Ticket`'s shape, and cross-tracker linkage questions
+    (`related_github_prs`/`linked_jira`/`linked_linear`) only work cleanly if
+    PRs and Jira/Linear issues share a class. Same reasoning: **no `Incident`
+    class** — jira/linear's `issue_type`/labels already cover it.
+17. **Relation coverage in the TBox is deliberately partial (~25% of the 600
+    questions map to a named relation).** The rest ask for narrative/numeric
+    facts embedded in prose (a retention period, a latency percentile, an
+    incident root cause) that a typed `Claim` triple can't usefully represent
+    — those are answered by chunk-level `LOOKUP`/`MULTIHOP` retrieval +
+    citation, not TBox relations. Forcing them into relations would be the
+    "speculative cataloguing" §7.6.2 explicitly forbids. `info_not_found` (20
+    questions) has no answer by design — that's the intended abstention
+    trigger, not a vocabulary gap.
+18. **`employee_directory.yaml`'s `manager` field is direct, high-confidence
+    ground truth for `REPORTS_TO`** — stronger than anything Tier-2 LLM
+    extraction would infer from prose. Prioritize it as a structural (Tier 1)
+    source for that relation, not an LLM-extraction target, when M2/M3 build
+    the resolution pipeline.
+19. **HydraDB property values can't hold lists or nested maps** (confirmed
+    live via `ontology/materialize.py`: `UNWIND row N field domain must be
+    scalar`). `tbox.yaml`'s list-valued `domain`/`range` fields (e.g. `STATUS`
+    domain `[Ticket, Project, Customer]`) are comma-joined to strings for
+    graph storage; `source_forms` (nested per-source maps) is JSON-encoded to
+    a string. `ontology/tbox.yaml` remains the structured source of truth —
+    the graph materialization exists to make the ontology queryable per
+    §7.6, not to replace the YAML.
 
 ## Node/edge counts
 
