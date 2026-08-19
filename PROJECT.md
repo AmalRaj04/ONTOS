@@ -12,7 +12,7 @@ Deadline: **2026-08-21, 12:29 PM IST**.
 |---|---|---|
 | M0 — Foundation | **done** | HydraDB running natively, round-trip verified, full P1-P7 probe run live, `docs/cypher-support.md` written, `src/schema/{models.py,ids.py}` committed, license present |
 | M0.5 — TBox frozen | **done** | `ontology/tbox.yaml` (8 classes, 15 relations) validated against all 600 questions (500+100), 0 vocabulary gaps; materialized as `:Class`/`:Relation` nodes, spot-checked live |
-| M1 — Walking skeleton | not started | |
+| M1 — Walking skeleton | **done** | Confluence adapter, Tier 1 (chunk+mention), Tier 2 (LLM claim extraction+TBox gate), full anchor→plan→traverse→gate→synthesize LOOKUP path — all verified against live HydraDB + real Gemini/Groq calls. `tests/test_m1_walking_skeleton.py` reproduces it. |
 | M2 — Ingest depth | not started | |
 | M3 — Entity resolution | not started | |
 | M4 — Conflict resolution | not started | |
@@ -139,6 +139,33 @@ prose, per the spec's own §0 rule. Each entry: what, why, where it's applied.
     extraction would infer from prose. Prioritize it as a structural (Tier 1)
     source for that relation, not an LLM-extraction target, when M2/M3 build
     the resolution pipeline.
+20. **[M1] Batch relationship creation between two already-existing nodes, confirmed
+    live, has three extra requirements beyond `cypher-compat.md`'s examples:**
+    (a) `UNWIND ... MATCH (x),(y) CREATE (x)-[...]->(y)` requires **both** endpoints
+    to already exist — you cannot inline-create one new endpoint alongside a
+    matched one in the same UNWIND CREATE (`"requires exactly two endpoint
+    nodes"`); a brand-new child node must be `MERGE`d as its own standalone batch
+    first, then linked in a second batch. (b) Both `MATCH` endpoint patterns in
+    that second batch **must each carry exactly one label**
+    (`MATCH (p:Parent {id:...}), (c:Child {id:...})`, not label-less `{id:...}`
+    — `"endpoints require exactly one label"`). (c) The relationship itself needs
+    its own integer `id` property in the same surrogate scheme as nodes
+    (`CREATE (p)-[:REL {id: row.rel_vertex, ...}]->(c)` —
+    `"relationship CREATE properties require id: row.<field>"`), and `MERGE`ing
+    on that same `id` (instead of `CREATE`) is idempotent and confirmed safe to
+    re-run (edge count unchanged on a repeat batch) — this is the pattern
+    `writer.py` uses for every edge type, since ingest must be resumable
+    (BUILD-SPEC.md §2). Full pattern in `src/ingest/writer.py`.
+21. **[M1] HydraDB parameters reject `null` outright, confirmed live**
+    (`"parameter $rows must contain booleans, signed or unsigned integers,
+    finite floats, strings, lists, or string-keyed maps"` — no null in that
+    list). Every `Document` field the frozen §7.5 model marks `Optional` (
+    `title`, `author_raw`, `thread_key`, `uri`, `declared_container`,
+    `created_at`) needs a non-null placeholder before it reaches HydraDB.
+    `src/ingest/writer.py`'s `_sanitize()` maps `None -> ""` uniformly across
+    every batch row before the write, so a batch's static `SET` clause always
+    has a settable value for every row regardless of which fields happen to
+    be null on which document.
 19. **HydraDB property values can't hold lists or nested maps** (confirmed
     live via `ontology/materialize.py`: `UNWIND row N field domain must be
     scalar`). `tbox.yaml`'s list-valued `domain`/`range` fields (e.g. `STATUS`
@@ -147,6 +174,63 @@ prose, per the spec's own §0 rule. Each entry: what, why, where it's applied.
     a string. `ontology/tbox.yaml` remains the structured source of truth —
     the graph materialization exists to make the ontology queryable per
     §7.6, not to replace the YAML.
+
+22. **[M1] Corpus-wide: no source uses a fixed `body`/`content` field — every
+    document names its own content fields via `content_field_names` (and title
+    via `title_field_name`), and this varies enormously within a single
+    source**, not just between sources. Confirmed by sampling ~300-2000 docs
+    per source: confluence alone has 800+ plain `{body}` pages but also
+    hundreds of 10-20-field RFC/runbook-style docs
+    (`summary, goals, architecture_overview, rollout_plan, ...`); slack splits
+    across `messages`/`text`/`thread`; linear/jira/github spread real content
+    across `description, comments, investigation_notes, resolution,
+    review_comments, release_notes, ...`. An adapter that reads a hardcoded
+    `body` or `content` key silently drops most of the corpus's actual text
+    (caught it immediately: the first Confluence doc tried came back with
+    `body length: 0`, because its real content lived in a field named
+    `content`, not `body`). **Fix, applied once for all nine adapters:**
+    `src/ingest/adapters/common.py`'s `assemble_body()`/`get_title()` read
+    `content_field_names`/`title_field_name` from each record dynamically and
+    concatenate in the document's own declared order (multi-field docs get
+    lightweight `## fieldname` section headers, which also helps Tier 2
+    extraction see document structure). Non-string field values (message
+    lists, comment lists) are flattened via common message-shape heuristics
+    (`text`/`body`/`message`/`content` + `author`/`user`/`sender` keys) rather
+    than assumed to be plain strings.
+
+23. **[M1] Both providers' model names in wide circulation are stale — confirmed
+    live.** Gemini rejects `gemini-2.5-flash` (`"no longer available to new
+    users... use models/gemini-3.6-flash"`); Groq's `/models` list has no
+    `llama-3.1-*` at all any more. Working models as of this build:
+    `gemini-3.6-flash` (Gemini) and `openai/gpt-oss-20b` (Groq, the fast/
+    high-volume model §16's table calls for). Both hardcoded as constants in
+    `src/llm/providers.py`, not buried in call sites, so a future provider
+    deprecation is a one-line fix. Also: Groq's `response_format:
+    {"type":"json_object"}` mode 400s unless the literal word "JSON" appears
+    somewhere in the prompt — every prompt in `src/query/plan.py` /
+    `src/ingest/tier2_semantic.py` says "as JSON" for this reason.
+24. **[M1] `WHERE ... IN [...]` is unsupported (confirmed in Phase 0, hit for
+    real here)** — `src/query/traverse.py`'s subject-set membership check is
+    built as an OR-chain of `c.subject_id = $sN` equality comparisons instead
+    of `IN`. Also newly confirmed: **a `MATCH` node pattern that carries a
+    label needs to be a named variable**, even for a pure pass-through hop
+    (`(:Chunk)` mid-pattern fails with `"node labels and non-id properties
+    require a named node"`; `(ch:Chunk)` is required).
+25. **[M1] `AUTHORED_BY` (Document→Person) is deliberately not written yet.**
+    §7.1 assigns Person IDs only "at canonicalization" (M3) — writing
+    `AUTHORED_BY` at Tier 1 would require either a premature, throwaway
+    Person node or pointing the edge at a Mention despite §7.3 typing it
+    Document→Person. Tier 1 stores `author_raw` on the Document (already a
+    frozen §7.5 field) and nothing else; M3's `canonicalize.py` is where
+    `AUTHORED_BY` gets materialized once a real Person node exists. Tier 2's
+    `ASSERTS`/`ABOUT` edges use the provisional-Mention pattern §8.4 already
+    sanctions explicitly, so no analogous gap there.
+26. **[M1] The walking skeleton ended up demonstrating real abstention, not
+    just a happy path** — "Who is the CFO of Ganymede Robotics?" (an entity
+    genuinely absent from the 2-document graph ingested so far) correctly
+    triggers `should_abstain` with `"entity not found under any known
+    alias"`, in the same test run as the successful LOOKUP. Worth keeping as
+    the first line of the M7 demo script once more of the corpus is in.
 
 ## Node/edge counts
 
@@ -165,6 +249,21 @@ prose, per the spec's own §0 rule. Each entry: what, why, where it's applied.
 - `THIRD_PARTY.md`, `.gitignore` (fixed), `docs/cypher-support.md`, `requirements.txt`.
 - No `schema.cypher` (see decision #2) — nothing else needed at bootstrap since
   HydraDB has no user-facing DDL of any kind.
+- `src/db/client.py` — Bolt session wrapper (causal/strong consistency modes).
+- `src/ingest/simhash.py`, `src/ingest/adapters/{base.py,common.py,confluence.py}`,
+  `src/ingest/{writer.py,tier1_structural.py,tier2_semantic.py}` — full Tier 1/Tier 2
+  path for one source (Confluence). `common.py`'s `assemble_body()`/`get_title()`
+  are shared by all nine adapters, not Confluence-specific (decision #22).
+- `src/llm/{providers.py,router.py,cache.py}` — Gemini+Groq dual-provider pattern,
+  content-addressed cache, task-based routing.
+- `src/query/{anchor.py,plan.py,traverse.py,gate.py,synthesize.py,pipeline.py}` —
+  full LOOKUP path, output contract per §11. MULTIHOP/CONFLICT/AGGREGATE/TEMPORAL
+  classify correctly (`plan.py`) but fall through to an informative
+  not-yet-implemented abstention in `pipeline.py` until M5.
+- `tests/test_m1_walking_skeleton.py` — reproduces the full walking skeleton
+  (ingest one real doc, extract claims, answer one LOOKUP question with citation,
+  demonstrate one real abstention). Hits live HydraDB + real LLM APIs; not a fast
+  unit test, a manual/CI-smoke verification.
 
 ## Environment
 
