@@ -232,6 +232,21 @@ prose, per the spec's own §0 rule. Each entry: what, why, where it's applied.
     alias"`, in the same test run as the successful LOOKUP. Worth keeping as
     the first line of the M7 demo script once more of the corpus is in.
 
+27. **BUILD-SPEC.md updated by the user (2026-08-19), M6/M7 only.** Two tasks
+    added inside M6 (both proof artifacts, not pipeline code): (a) run
+    HydraDB's own comparison harness against Neo4j
+    (`vendor/hydradb/scripts/neo4j_exact_hop_benchmark.sh`, `just
+    query-bench`/`minio-query-bench`) on this project's actual `algo.MSpaths`
+    ER-scoring workload — read the script first to see if it's directly
+    parameterizable — and write a real timed table to
+    `docs/hydradb-comparison.md`; (b) swap the recovery demo to `just
+    minio-chaos` against the actual populated graph, which requires the
+    MinIO-backed deployment for that proof run specifically (M1-M5 keep using
+    the faster `CLOUD_PROVIDER=local` node day-to-day, unchanged). M7 gained
+    one line: README §7 must cite the M6 comparison numbers directly. Nothing
+    before M6 changed — M1-M5 already complete are unaffected. Full detail
+    to be re-read from BUILD-SPEC.md §13 when M6 starts.
+
 ## Node/edge counts
 
 (populated starting M2)

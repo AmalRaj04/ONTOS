@@ -749,9 +749,29 @@ DoD: full eval run complete with per-category scores, three abstention numbers, 
 ablation, BM25 baseline, error analysis written. Numbers may be modest — they must be
 real and reproducible (`strong` consistency, resumable harness).
 
+**Added after M0–M5 were already in progress — does not change anything before this
+point, does not require revisiting M1–M5 work.** Two additional tasks, both proof
+artifacts rather than pipeline code:
+
+- **Official comparison, not a claimed one.** HydraDB ships its own comparison harness:
+  `scripts/neo4j_exact_hop_benchmark.sh` (pulls Neo4j in Docker) and
+  `just query-bench` / `just minio-query-bench`. Read the script first — confirm
+  whether it's parameterizable against a custom query, or whether its methodology needs
+  adapting to run the project's actual `algo.MSpaths` pairwise ER-candidate-scoring
+  call (§9) against the client-side-fan-out equivalent on Neo4j. Either way, produce one
+  real timed table on this project's actual workload, not a synthetic one, and put it in
+  `docs/hydradb-comparison.md`.
+- **Swap the recovery proof to HydraDB's own chaos harness.** Use `just minio-chaos`
+  (pauses, restarts, and recovers MinIO during graph operations) against the actual
+  populated ontology graph, instead of a hand-rolled kill/restart script. This requires
+  the MinIO-backed deployment specifically for this proof run — day-to-day development
+  in M1–M5 can keep using the faster `CLOUD_PROVIDER=local` node from §6 unchanged.
+
 **M7 — Ship.**
 DoD: README complete, THIRD_PARTY.md present, demo UI or CLI functional, video script
-ready, all nine boxes in the planning doc's "definition of done" checked.
+ready, all nine boxes in the planning doc's "definition of done" checked. README §7
+("what would this lose without HydraDB") cites the M6 comparison numbers directly,
+not just the architectural claim.
 
 ## 14. Explicit scope cuts — do not build these without checking in
 
