@@ -6,12 +6,35 @@ below always takes a batch (`rows`), even for a single record.
 """
 
 import os
+import time
 from contextlib import contextmanager
 
+import neo4j.exceptions
 from neo4j import GraphDatabase
 
 CAUSAL = "causal"
 STRONG = "strong"
+
+# The M2 full-corpus ingest hit a real, transient failure mode under sustained load:
+# a write blocked behind server-side compaction backpressure and got killed by the
+# server's own 30s query-runtime limit ("client_query_runtime exceeded query
+# timeout"). This is not a data bug — retrying after a short backoff succeeds once
+# compaction catches up. Every write/read here retries a bounded number of times
+# rather than propagating a transient error and killing an hours-long ingest run.
+_MAX_RETRIES = 8
+_BACKOFF_SECONDS = 10
+
+
+def _retry(fn):
+    last_exc = None
+    for attempt in range(_MAX_RETRIES):
+        try:
+            return fn()
+        except (neo4j.exceptions.TransientError, neo4j.exceptions.ServiceUnavailable) as e:
+            last_exc = e
+            if attempt < _MAX_RETRIES - 1:
+                time.sleep(_BACKOFF_SECONDS * (attempt + 1))
+    raise last_exc
 
 
 class HydraClient:
@@ -40,9 +63,16 @@ class HydraClient:
         """Batched UNWIND write. `query` must start with `UNWIND $rows AS row`."""
         if not rows:
             return
-        with self.session() as session:
-            session.run(query, rows=rows).consume()
+
+        def _do():
+            with self.session() as session:
+                session.run(query, rows=rows).consume()
+
+        _retry(_do)
 
     def run_read(self, query: str, **params):
-        with self.session() as session:
-            return list(session.run(query, **params))
+        def _do():
+            with self.session() as session:
+                return list(session.run(query, **params))
+
+        return _retry(_do)

@@ -4,6 +4,7 @@ pyyaml
 google-genai
 groq
 datasketch
+numpy
 networkx
 tqdm
 streamlit

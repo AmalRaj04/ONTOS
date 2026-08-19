@@ -500,9 +500,36 @@ class SourceAdapter(ABC):
 One file per source under `src/ingest/adapters/`. Inspect real record shapes before
 writing each adapter — do not assume a schema, read a sample file first.
 
-### 8.3 Tier 1 — structural (no LLM, full corpus)
+### 8.3 Tier 1 — structural (no LLM, disk-budget-prioritized)
 
-For every `Document`:
+**Updated after real measurement during the build: HydraDB's per-property key storage
+model (vertices, props, topology, and idempotency markers as separate keys — see
+`architecture.md`) runs roughly 150-200KB of graph data per document once chunks and
+mentions are written, not the few KB the raw text would suggest. At that density the
+full ~512K-document corpus needs on the order of 90GB — plan ingest order around
+whatever disk budget is actually available rather than assuming full-corpus capacity.**
+
+Before ingesting at volume: report average `Chunk` and `Mention` node count per document.
+If it's higher than expected, check whether chunk size (~500 tokens) and mention
+selectivity are actually matching this spec — tightening either one directly reduces
+per-document storage.
+
+Ingest order, whatever the available disk budget turns out to be:
+1. **Question-priority tier, always ingest first, non-negotiable.** Resolve the entities
+   named in all 500 official questions plus the 100 extra questions against candidate
+   documents; ingest those documents first, guaranteed, regardless of source or how much
+   budget remains afterward. Missing these costs real eval score through false
+   abstention, not just thoroughness.
+2. **Stratified fill.** Spend remaining disk budget on a proportional sample across all
+   nine sources, for entity-resolution variety, near-duplicate coverage, and conflict
+   coverage.
+3. **Record the real number.** Whatever fraction actually gets ingested, write it to
+   `docs/coverage.md` as a plain statement (documents ingested / 511,958, by source) —
+   this is a disk-imposed scope decision, state it as one, the same way Tier 2's sampling
+   is already documented in §8.4. Update every place BUILD-SPEC.md or the README template
+   currently says a full-corpus number.
+
+For every `Document` selected by the ordering above:
 1. Write the `Document` node.
 2. Chunk the body (simple paragraph/token-window split, ~500 tokens, is sufficient).
 3. Extract deterministic mentions: `@handles`, email addresses, ticket-ID patterns
@@ -536,8 +563,9 @@ def write_documents_no_merge(session, docs: list[Document]):
 ```
 
 Batch size from `INGEST_BATCH_SIZE` (default 500). **Checkpoint after every batch** —
-write the last-processed offset per source to a local file. A crash at document 300,000
-must resume near there, not at zero.
+write the last-processed offset per source to a local file. A disk-full condition or a
+crash mid-run must resume near there, not at zero, and must not corrupt the
+already-written question-priority tier.
 
 ### 8.4 Tier 2 — semantic (LLM-backed, targeted subset)
 

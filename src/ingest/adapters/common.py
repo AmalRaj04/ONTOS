@@ -11,6 +11,35 @@ silently drops most of the corpus's actual text — see PROJECT.md decision #22.
 """
 
 import json
+from collections.abc import Iterator
+from datetime import UTC, datetime
+from pathlib import Path
+
+
+def iter_records(corpus_dir: str, source_system: str) -> Iterator[tuple[dict, Path]]:
+    """Every adapter's file layout is the same: <corpus_dir>/<source_system>/**/*.json."""
+    root = Path(corpus_dir) / source_system
+    for file_path in sorted(root.rglob("*.json")):
+        with open(file_path) as f:
+            yield json.load(f), file_path
+
+
+def parse_iso_date(s: str | None) -> datetime | None:
+    if not s:
+        return None
+    try:
+        return datetime.fromisoformat(s)
+    except ValueError:
+        return None
+
+
+def parse_unix_ts(s: str | int | float | None) -> datetime | None:
+    if s is None or s == "":
+        return None
+    try:
+        return datetime.fromtimestamp(float(s), tz=UTC)
+    except (ValueError, TypeError, OSError):
+        return None
 
 
 def get_title(record: dict) -> str | None:

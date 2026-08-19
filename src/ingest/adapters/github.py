@@ -1,8 +1,7 @@
-"""Confluence adapter. Real field shapes confirmed by reading
-vendor/EnterpriseRAG-Bench/generated_data/sources/confluence/**/*.json directly (per
-BUILD-SPEC.md §8.2's "inspect real record shapes before writing each adapter"), not
-assumed from the field-name list in the corpus's own README.
-"""
+"""GitHub adapter. Real field shapes confirmed from
+vendor/EnterpriseRAG-Bench/generated_data/sources/github/**/*.json. PRs are modeled
+in the TBox as Ticket (tracker: github), not a new class — see
+docs/tbox-validation.md."""
 
 import hashlib
 from collections.abc import Iterator
@@ -15,8 +14,8 @@ from src.schema.ids import node_id
 from src.schema.models import Document
 
 
-class ConfluenceAdapter(SourceAdapter):
-    source_system = "confluence"
+class GithubAdapter(SourceAdapter):
+    source_system = "github"
 
     def build_document(self, rec: dict, file_path: Path) -> Document:
         native_id = rec.get("dataset_doc_uuid") or file_path.stem
@@ -29,16 +28,11 @@ class ConfluenceAdapter(SourceAdapter):
             body=body,
             created_at=parse_iso_date(rec.get("created_at")),
             author_raw=rec.get("author"),
-            thread_key=None,  # Confluence pages have no thread concept
-            uri=rec.get("original_location"),
+            thread_key=None,
+            uri=f"github://{rec.get('repo')}/pull/{rec.get('pr_number')}",
             content_hash=hashlib.sha256(body.encode()).hexdigest(),
             simhash=compute_simhash(body),
-            # `space` is the page's self-declared container; its own file-system
-            # location under generated_data/sources/confluence/<dir>/ can differ
-            # (the corpus's noise injection deliberately misfiles some pages) —
-            # exactly the case query/traverse.py's inferred-container handling
-            # (docs/planning/02 §6.1) needs to demonstrate.
-            declared_container=rec.get("space"),
+            declared_container=rec.get("repo"),
         )
 
     def iter_documents(self, path: str) -> Iterator[Document]:

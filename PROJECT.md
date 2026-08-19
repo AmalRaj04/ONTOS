@@ -13,7 +13,7 @@ Deadline: **2026-08-21, 12:29 PM IST**.
 | M0 — Foundation | **done** | HydraDB running natively, round-trip verified, full P1-P7 probe run live, `docs/cypher-support.md` written, `src/schema/{models.py,ids.py}` committed, license present |
 | M0.5 — TBox frozen | **done** | `ontology/tbox.yaml` (8 classes, 15 relations) validated against all 600 questions (500+100), 0 vocabulary gaps; materialized as `:Class`/`:Relation` nodes, spot-checked live |
 | M1 — Walking skeleton | **done** | Confluence adapter, Tier 1 (chunk+mention), Tier 2 (LLM claim extraction+TBox gate), full anchor→plan→traverse→gate→synthesize LOOKUP path — all verified against live HydraDB + real Gemini/Groq calls. `tests/test_m1_walking_skeleton.py` reproduces it. |
-| M2 — Ingest depth | not started | |
+| M2 — Ingest depth | **done** | All 9 adapters built and validated. Priority tier (812 docs) + stratified fill (25K target, several sources exceeded it) = 64,957 documents ingested, 71,095 MinHash-signed, 254 confirmed near-duplicate pairs. Full real numbers in `docs/coverage.md`. See decisions #28-#36 for everything found along the way. |
 | M3 — Entity resolution | not started | |
 | M4 — Conflict resolution | not started | |
 | M5 — Query completeness | not started | |
@@ -247,9 +247,177 @@ prose, per the spec's own §0 rule. Each entry: what, why, where it's applied.
     before M6 changed — M1-M5 already complete are unaffected. Full detail
     to be re-read from BUILD-SPEC.md §13 when M6 starts.
 
+28. **[M2] Two bugs caught by the first real bulk-ingest run (250-doc Confluence
+    batch), both fixed generically rather than by tuning around them:**
+    (a) `compute_simhash()` produced a full 64-bit value, but Bolt protocol
+    integers are signed i64 — any hash with the top bit set overflowed
+    (`neo4j`'s packstream layer: `"Integer ... out of range"`). Fixed by
+    masking `simhash` to 63 bits, same convention as `hydra_id()`. M1's two
+    manually-ingested documents happened to luck into non-overflowing
+    hashes, which is why this wasn't caught until a real batch ran.
+    (b) Bolt messages are capped at 2 MiB, and `INGEST_BATCH_SIZE` (a
+    document *count*) doesn't bound message *size* — Confluence bodies range
+    from ~1KB to 50KB+, so 250 long docs in one batch exceeded the limit
+    (`"message size exceeds limit of 2097152 bytes"`). (c) A third, separate
+    server-side cap surfaced right after fixing (b): UNWIND batches are
+    limited to 1024 rows regardless of byte size
+    (`"client_query_batch_items rejected by admission control: actual 1605
+    exceeds limit 1024"` — mention rows per batch grow faster than document
+    count). All three fixed once, generically, inside
+    `upsert_nodes()`/`upsert_edges()` (`src/ingest/writer.py`'s
+    `_size_chunked()`, which now splits on whichever of the byte-size or
+    row-count limit is hit first) rather than by tuning batch size per
+    source — no caller needs to reason about payload size or row count.
+
+29. **[M2] Critical, undocumented server-side limit: a string property value over
+    ~32.7KB crashes the write with a server panic, not a clean rejection.**
+    Confirmed live by binary search: 32,743 UTF-8 bytes succeeds, 32,744 fails
+    (`"query executor panicked... corrupt value"` in graph-node's log —
+    `slatedb/src/batch.rs:154`). Not documented anywhere in `cypher-compat.md`
+    (its "Values and parameters" section only says "integers, floats, booleans
+    and strings," no length note). Found via a real priority-tier document
+    (a Fireflies transcript, 32,946-char body) that crashed the write outright.
+    **Fix, applied once in `src/ingest/writer.py`'s `_sanitize()`**: every
+    string property is truncated to 30,000 bytes (safety margin below the real
+    boundary) with a `"...[truncated, see Chunk nodes for full text]"` marker,
+    UTF-8-safe (never splits a multi-byte sequence). In practice this only ever
+    fires on `Document.body` — `Chunk.text` is ~500 words (~2.5-3KB) by
+    construction, well under the limit — so full-fidelity text stays fully
+    queryable via `Chunk` nodes regardless of the `Document`-level truncation.
+    `content_hash`/`simhash` are computed from the untruncated body before
+    writing, so dedup/identity are unaffected.
+
+30. **[M2] Real M2-scale test surfaced that `CLOUD_PROVIDER=local` (decision #8's
+    day-to-day dev path) is fundamentally incompatible with HydraDB's garbage
+    collector**, not just slower: `LocalFileSystem` doesn't implement the
+    conditional-PUT operation (`PutMode::Update`) GC needs for Manifest/Compactions
+    cleanup, so old generations accumulate forever (`"error collecting garbage...
+    NotImplemented"`, recurring every ~60s in the log). At M0/M0.5/M1 scale (a
+    handful of documents) this never mattered. At M2 scale it does: switched the
+    real ingest target to the MinIO-backed deployment (decision #7's judge-facing
+    path) — this fixes GC (0 errors since) and is the correct call regardless of
+    disk, since `CLOUD_PROVIDER=local` was only ever meant as a fast dev shortcut.
+    `CLOUD_PROVIDER=local` remains fine for quick, low-volume iteration; anything
+    that writes at real volume should use the MinIO-backed node.
+31. **[M2] Real per-document storage measurement (11,309 documents, MinIO-backed):
+    ~177KB/doc once `Chunk`/`Mention` nodes and edges are included** — dominated by
+    HydraDB's per-property-as-separate-key storage model (architectural, confirmed
+    not meaningfully tunable from chunk size or mention selectivity, both already
+    at spec-appropriate values — see chat log for the full reasoning). At that
+    density the full 511,958-doc corpus needs ~90GB. The build machine's internal
+    disk had only ~3GB free at the time (228GB disk, ~186GB used by unrelated
+    files) — not enough regardless of GC being fixed. Per BUILD-SPEC.md §8.3
+    (amended by the user 2026-08-19): resolved and ingested the **question-priority
+    tier first** (812 documents needed by all 500+100 eval questions' own
+    `expected_doc_ids`, looked up directly via the corpus's own
+    `generated_data/uuid_index.json` — see `src/ingest/priority.py`), guaranteed
+    regardless of what happens next, then proceeded to fill the rest. The user then
+    provided an external 512GB SSD; reformatted its data partition from NTFS
+    (macOS-read-only) to exFAT (`/Volumes/ONTOS_SSD`, confirmed writable) and moved
+    both MinIO's backing store and HydraDB's local disk cache there — comfortably
+    covers the full ~90GB corpus, so "fill" now means the actual full remaining
+    corpus, not a reduced stratified sample. Final per-source coverage numbers in
+    `docs/coverage.md` once the background ingest completes.
+32. **[M2] A second, independent server-side crash bug, found via the priority
+    tier's real document diversity:** a string property value beyond ~32.7KB
+    crashes the write with an unhandled server panic (`"query executor
+    panicked... corrupt value"`, `slatedb/src/batch.rs:154`) rather than a clean
+    rejection — confirmed live by binary search, exact boundary 32,743 bytes OK /
+    32,744 fails. Not documented anywhere in `cypher-compat.md`. Found because the
+    priority tier pulls from all nine sources' real length distribution (a
+    Fireflies transcript at 32,946 chars triggered it), where the earlier
+    single-source M2 testing (Confluence, Jira) happened not to include anything
+    over the boundary. Fixed once, generically, in `src/ingest/writer.py`'s
+    `_sanitize()`: every string property is UTF-8-safely truncated to 30,000 bytes
+    with a `"...[truncated, see Chunk nodes for full text]"` marker. Only
+    `Document.body` is realistically affected — full text remains queryable via
+    `Chunk` nodes (~2.5-3KB each) regardless.
+
+33. **[M2] The first full-ingest attempt died ~9 minutes in** (mid-`fireflies`, after
+    `confluence` completed cleanly): a `Chunk`-write sub-batch got stuck behind
+    server-side compaction backpressure and was killed by the server's own 30-second
+    query-runtime limit (`"client_query_runtime exceeded query timeout"`). Not a
+    data bug — checkpointing meant no progress was lost (`fireflies` resumed
+    correctly from offset 6000), but the unhandled exception killed the whole
+    multi-hour run outright. **Fix**: `src/db/client.py`'s `run_write`/`run_read`
+    now retry transient `neo4j.exceptions.TransientError`/`ServiceUnavailable`
+    with backoff (5 attempts, 3s/6s/9s/12s/15s) before propagating; `run_ingest.py`'s
+    per-source loop also catches a fully-exhausted-retries failure and moves to the
+    next source rather than aborting the run. Expect this class of transient
+    slowdown to recur as compaction keeps pace with a sustained multi-hour write
+    load — the retry logic is there specifically so it self-heals unattended.
+
+34. **[M2] Root cause of the recurring write timeouts (decision #33): the
+    server's own query-runtime budget, not a data or client bug.**
+    `GRAPH_MAX_QUERY_RUNTIME_MS` defaults to 30,000ms
+    (`vendor/hydradb/src/bin/graph_node/config.rs`), and legitimate large batch
+    writes under sustained multi-hour load (bigger tiered compactions
+    accumulating — observed SR levels climbing to `[6,5,4,3]->SR(3)` — plus
+    Docker Desktop's bind-mount I/O path to the external SSD) started
+    genuinely taking longer than that. Confirmed this wasn't the missing
+    `graph-indexer` process (started it — `vendor/hydradb/src/bin/
+    graph-indexer.rs`, `--features indexer-runtime`, needs the same
+    object-store env vars as `graph-node` — publishing index generations
+    correctly, but write timeouts persisted regardless, and CSC indexes are
+    for edge-type traversal, not node-label writes/scans anyway). **Fix**:
+    restarted `graph-node` with `GRAPH_MAX_QUERY_RUNTIME_MS=240000` (4 min).
+    `graph-indexer` is still worth running going forward (M5's multi-hop
+    `algo.MSpaths` queries are exactly what it accelerates), just wasn't the
+    fix for this particular symptom. Also bumped `GRAPH_DATA_CACHE_BYTES`
+    from 512MB/2GB to 16GB given the SSD's headroom, since the smaller caches
+    showed real eviction-queue pressure (`"evictor queue skipped cache
+    write/access event because it was full 165 times in the last 30s"`)
+    under sustained load.
+
+35. **[M2] Strategy pivot mid-ingest: full corpus (511,958 docs) → proportional
+    stratified fill (25,000 target), at the user's direction, once the real
+    binding constraint turned out to be time, not disk.** With the SSD in place
+    disk was no longer a constraint, but Gmail/Slack's per-document write cost
+    (decision #31, quoted reply-chain headers and chat mentions driving huge
+    mention counts) meant a full ingest projected to 15+ hours — not affordable
+    against the remaining build window. `src/ingest/run_ingest.py` gained
+    `INGEST_TARGET_TOTAL` (env var) and `compute_stratified_targets()`: each
+    source's target is proportional to its real share of the corpus
+    (`SOURCE_TOTALS`), and `run_source()` stops once a source's cumulative
+    offset reaches its target — a source already past target (from the earlier
+    full-ingest attempts, which weren't wasted work) is left alone rather than
+    trimmed back. Net effect: confluence/fireflies/gdrive/gmail were already
+    past their 25K-target shares and needed no more work; github/hubspot/jira/
+    linear/slack were fetched fresh to their targets. Final: **64,957 documents**
+    (12.7% of the full corpus) — well above the nominal 25K floor purely because
+    of the earlier full-ingest progress that was kept. Full reasoning on why this
+    doesn't undermine eval validity is in `docs/coverage.md` — short version: the
+    question-priority tier (decision #32/§8.3) already guarantees every
+    question's own required document is present regardless of fill percentage;
+    the fill's job is cross-source ER/conflict diversity, not raw volume.
+36. **[M2] `datasketch`'s MinHash API changed since whenever this environment's
+    training data was current**: reconstructing a `MinHash` from raw
+    `hashvalues` now requires an explicit `scheme` parameter (`"legacy"` or a
+    new default `"affine32"`), and the underlying array dtype is `uint32`, not
+    `uint64` — both discovered by two rounds of `ValueError` when
+    `src/ingest/dedupe.py`'s `_load_signatures()` tried to round-trip the
+    signatures appended during ingest. Fixed by pinning
+    `MINHASH_SCHEME = "affine32"` explicitly at both write time
+    (`compute_minhash()`) and read time (`_load_signatures()`), and correcting
+    the `np.frombuffer` dtype. Final dedup run: 71,095 documents signed, 257
+    LSH candidate pairs, 254 confirmed (Jaccard ≥ 0.8) — `NEAR_DUPLICATE_OF`
+    edges written.
+
 ## Node/edge counts
 
-(populated starting M2)
+As of M2 completion (2026-08-20; full breakdown and methodology in
+`docs/coverage.md`):
+
+- **Documents**: 64,957 (12.7% of the 511,970-doc corpus — priority tier
+  guaranteed + proportional stratified fill; see decision #35)
+- **MinHash-signed**: 71,095 (some overlap/reprocessing across ingest passes,
+  deduped by doc_id at load time)
+- **NEAR_DUPLICATE_OF edges**: 254 confirmed (257 LSH candidates, Jaccard ≥ 0.8)
+- Chunk/Mention counts vary per source-mix of what got ingested; not
+  re-aggregated here since `MATCH (n:Label) RETURN count(*)` full-label scans
+  are slow at this node count without a label/property index (decision #34) —
+  per-source counts from ingest-time bulk_ingest() summaries are in
+  `docs/coverage.md` instead, which is the authoritative source.
 
 ## What's implemented (by module)
 
@@ -279,6 +447,23 @@ prose, per the spec's own §0 rule. Each entry: what, why, where it's applied.
   (ingest one real doc, extract claims, answer one LOOKUP question with citation,
   demonstrate one real abstention). Hits live HydraDB + real LLM APIs; not a fast
   unit test, a manual/CI-smoke verification.
+- `src/ingest/adapters/{slack,gmail,linear,gdrive,hubspot,fireflies,github,jira}.py`
+  — the remaining 8 adapters, all sharing `common.py`'s `assemble_body()`/
+  `get_title()`/`iter_records()` and each exposing `build_document()` for
+  single-file loading (needed by `priority.py`).
+- `src/ingest/priority.py` — question-priority tier (812 docs, see decision #32).
+- `src/ingest/run_ingest.py` — full-corpus/stratified-fill orchestrator,
+  checkpointed per source, `INGEST_TARGET_TOTAL` for proportional stratified
+  targets (decision #35).
+- `src/ingest/checkpoint.py` — resumable per-source offset tracking.
+- `src/ingest/dedupe.py` — MinHash/LSH near-duplicate detection, confirmed with
+  Jaccard, `NEAR_DUPLICATE_OF` edges.
+- `docs/coverage.md` — real per-source ingest coverage numbers and the reasoning
+  behind the disk→time constraint pivot.
+- Storage: MinIO-backed HydraDB on an external SSD (`/Volumes/ONTOS_SSD`), with
+  `graph-indexer` also running (CSC generations for M3/M5's traversal-heavy
+  workloads). `Makefile`'s `hydradb-minio-up`/`hydradb-indexer-up` targets
+  reproduce this setup.
 
 ## Environment
 

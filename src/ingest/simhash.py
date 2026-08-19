@@ -16,10 +16,13 @@ def _shingles(text: str, k: int = 4) -> list[str]:
 
 
 def compute_simhash(text: str) -> int:
-    bits = [0] * 64
+    """63-bit result (not the full 64) — Bolt protocol integers are signed i64, and
+    a raw 64-bit hash can exceed that range (confirmed live:
+    neo4j._codec.packstream raises OverflowError on values >= 2**63)."""
+    bits = [0] * 63
     for shingle in _shingles(text):
         h = int.from_bytes(hashlib.blake2b(shingle.encode(), digest_size=8).digest(), "big")
-        for i in range(64):
+        for i in range(63):
             bits[i] += 1 if (h >> i) & 1 else -1
     result = 0
     for i, b in enumerate(bits):

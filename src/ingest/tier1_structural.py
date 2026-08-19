@@ -1,8 +1,14 @@
 """Tier 1 — structural, no LLM, full corpus. BUILD-SPEC.md §8.3.
 
 For every Document: write the node, chunk the body, extract deterministic mentions
-via regex, write structural edges. Near-duplicate detection (step 5, dedupe.py) runs
-separately over the whole corpus in M2, not per-document here.
+via regex, write structural edges. Near-duplicate detection (step 5) is
+src/ingest/dedupe.py, run as a separate corpus-wide pass after ingest (M2), not
+per-document here.
+
+`bulk_ingest()` is the real M2 entry point — it batches chunk/mention writes across
+however many documents are passed in, so run_ingest.py can do one round trip per
+INGEST_BATCH_SIZE documents instead of one per document. `ingest_document()` is a
+thin single-document wrapper kept for M1's walking-skeleton test.
 """
 
 import re
@@ -27,10 +33,10 @@ def chunk_body(body: str, chunk_words: int = CHUNK_WORDS) -> list[dict]:
     paragraph/token-window split... is sufficient")."""
     if not body:
         return []
-    chunks = []
     words = list(re.finditer(r"\S+", body))
     if not words:
         return []
+    chunks = []
     ordinal = 0
     i = 0
     while i < len(words):
@@ -74,29 +80,45 @@ def extract_mentions(text: str) -> list[dict]:
     return mentions
 
 
-def ingest_document(client: HydraClient, doc: Document) -> dict:
-    """Write one Document through the full Tier 1 path. Returns a summary dict for
-    logging/testing (chunk count, mention count)."""
-    write_documents(client, [doc])
+def bulk_ingest(client: HydraClient, docs: list[Document]) -> dict:
+    """One batch of documents through the full Tier 1 path in a bounded number of
+    round trips, regardless of batch size."""
+    if not docs:
+        return {"doc_count": 0, "chunk_count": 0, "mention_count": 0}
 
-    chunk_dicts = chunk_body(doc.body)
-    for c in chunk_dicts:
-        c["chunk_id"] = node_id("chunk", doc.doc_id, str(c["ordinal"]))
-    write_chunks(client, doc.doc_id, chunk_dicts)
+    write_documents(client, docs)
 
-    total_mentions = 0
-    for c in chunk_dicts:
-        raw_mentions = extract_mentions(c["text"])
-        for m in raw_mentions:
+    all_chunks: list[dict] = []
+    for doc in docs:
+        for c in chunk_body(doc.body):
+            c["doc_id"] = doc.doc_id
+            c["chunk_id"] = node_id("chunk", doc.doc_id, str(c["ordinal"]))
+            all_chunks.append(c)
+    write_chunks(client, all_chunks)
+
+    all_mentions: list[dict] = []
+    for c in all_chunks:
+        for m in extract_mentions(c["text"]):
             doc_offset = c["char_start"] + m["char_offset"]
             m["char_offset"] = doc_offset
-            m["mention_id"] = node_id("mention", doc.doc_id, str(doc_offset), m["surface"])
-        if raw_mentions:
-            write_mentions(client, c["chunk_id"], raw_mentions)
-        total_mentions += len(raw_mentions)
+            m["chunk_id"] = c["chunk_id"]
+            m["mention_id"] = node_id("mention", c["doc_id"], str(doc_offset), m["surface"])
+            all_mentions.append(m)
+    write_mentions(client, all_mentions)
 
     return {
+        "doc_count": len(docs),
+        "chunk_count": len(all_chunks),
+        "mention_count": len(all_mentions),
+    }
+
+
+def ingest_document(client: HydraClient, doc: Document) -> dict:
+    """Single-document convenience wrapper — kept for M1's walking-skeleton test.
+    M2's real ingest uses bulk_ingest() directly for batching."""
+    summary = bulk_ingest(client, [doc])
+    return {
         "doc_id": doc.doc_id,
-        "chunk_count": len(chunk_dicts),
-        "mention_count": total_mentions,
+        "chunk_count": summary["chunk_count"],
+        "mention_count": summary["mention_count"],
     }
