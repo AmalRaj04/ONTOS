@@ -19,6 +19,12 @@ from src.schema.models import Claim, Document
 
 TBOX_PATH = Path(__file__).parent.parent.parent / "ontology" / "tbox.yaml"
 UNMAPPED_PATH = Path("data/claims_unmapped.jsonl")
+# Local mirror of every written claim, keyed the same as the graph write. M4
+# (src/conflict/*) reads from here rather than a live `MATCH (c:Claim)` scan —
+# full-corpus label scans are slow without a property index at this graph's scale
+# (PROJECT.md decision #34); a local JSONL avoids that entirely for a step that,
+# like ER, isn't on the query hot path.
+CLAIMS_LOCAL_PATH = Path("data/claims.jsonl")
 
 _PROMPT_TEMPLATE = """Extract factual claims from this document as JSON.
 Each claim: {{"predicate": str, "subject": str, "object": str,
@@ -59,12 +65,33 @@ def _write_unmapped(doc_id: str, raw_claim: dict, reason: str) -> None:
         f.write(json.dumps({"doc_id": doc_id, "claim": raw_claim, "reason": reason}) + "\n")
 
 
-def process_document(client: HydraClient, router: LLMRouter, doc: Document, chunk_id: str) -> dict:
+def _append_claim_local(row: dict, doc_id: str, source_system: str) -> None:
+    CLAIMS_LOCAL_PATH.parent.mkdir(parents=True, exist_ok=True)
+    entry = {**row, "doc_id": doc_id, "source_system": source_system}
+    with open(CLAIMS_LOCAL_PATH, "a") as f:
+        f.write(json.dumps(entry) + "\n")
+
+
+def process_document(
+    client: HydraClient, router: LLMRouter, doc: Document, chunk_id: str, chunks: list[dict] | None = None
+) -> dict:
     """Extract, TBox-validate, and write claims for one document. `chunk_id` is the
-    Chunk to attach EVIDENCED_BY to (M1: the document's first chunk; M2's real
-    pipeline attaches to whichever chunk the evidence_span actually falls in)."""
+    fallback Chunk to attach EVIDENCED_BY to when a claim's evidence_span can't be
+    resolved to a specific chunk (or when `chunks` isn't provided — M1's single-
+    document path). `chunks`: this document's own chunk_body() output (M2's bulk
+    Tier 2 path, src/ingest/run_tier2.py) — when given, each claim's evidence_span
+    is resolved to whichever chunk's [char_start, char_end) window actually
+    contains it, falling back to `chunk_id` only if no window matches."""
     tbox = _load_tbox()
     raw_claims = extract_claims_raw(router, doc, tbox)
+
+    def _resolve_chunk(char_start: int) -> str:
+        if not chunks:
+            return chunk_id
+        for c in chunks:
+            if c["char_start"] <= char_start < c["char_end"]:
+                return c["chunk_id"]
+        return chunk_id
 
     written = 0
     dropped = 0
@@ -97,6 +124,7 @@ def process_document(client: HydraClient, router: LLMRouter, doc: Document, chun
 
         claim_id = node_id("claim", subject_id, predicate, obj or "", doc.doc_id)
         span = raw.get("evidence_span") or [0, 0]
+        resolved_chunk_id = _resolve_chunk(span[0] if len(span) > 0 else 0)
 
         claim = Claim(
             claim_id=claim_id,
@@ -107,19 +135,20 @@ def process_document(client: HydraClient, router: LLMRouter, doc: Document, chun
             polarity=raw.get("polarity", "affirm"),
             asserted_at=doc.created_at,
             extraction_confidence=float(raw.get("confidence", 0.5)),
-            evidence_chunk_id=chunk_id,
+            evidence_chunk_id=resolved_chunk_id,
         )
         row = claim.model_dump(mode="json")
         row["vertex"] = hydra_id(claim_id)
         row["char_start"] = span[0] if len(span) > 0 else 0
         row["char_end"] = span[1] if len(span) > 1 else 0
         claim_node_rows.append(row)
+        _append_claim_local(row, doc.doc_id, doc.source_system)
 
         evidenced_by_rows.append(
             {
                 "from_vertex": hydra_id(claim_id),
-                "to_vertex": hydra_id(chunk_id),
-                "rel_vertex": hydra_id(f"evidenced_by:{claim_id}:{chunk_id}"),
+                "to_vertex": hydra_id(resolved_chunk_id),
+                "rel_vertex": hydra_id(f"evidenced_by:{claim_id}:{resolved_chunk_id}"),
                 "char_start": row["char_start"],
                 "char_end": row["char_end"],
             }

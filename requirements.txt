@@ -4,6 +4,7 @@ pyyaml
 google-genai
 groq
 datasketch
+rank_bm25
 numpy
 networkx
 tqdm

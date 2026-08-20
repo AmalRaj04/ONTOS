@@ -10,6 +10,7 @@ own text assumed — see PROJECT.md decision #23):
 
 import json
 import os
+import time
 from abc import ABC, abstractmethod
 
 from google import genai
@@ -17,6 +18,25 @@ from groq import Groq
 
 GEMINI_MODEL = "gemini-3.6-flash"
 GROQ_MODEL = "openai/gpt-oss-20b"
+
+# Free-tier rate limits get hit hard once M3/M4/M6 fan out real call volume —
+# ER adjudication and Tier 2 claim extraction both route to Gemini and can run
+# concurrently. A transient 429/503 with no retry would just permanently lose
+# that item; cheap insurance against burning hard-won LLM budget on a blip.
+_MAX_RETRIES = 4
+_BACKOFF_SECONDS = 8
+
+
+def _with_retry(fn):
+    last_exc = None
+    for attempt in range(_MAX_RETRIES):
+        try:
+            return fn()
+        except Exception as e:  # noqa: BLE001 - provider SDKs raise their own exception types
+            last_exc = e
+            if attempt < _MAX_RETRIES - 1:
+                time.sleep(_BACKOFF_SECONDS * (attempt + 1))
+    raise last_exc
 
 
 def _parse_json(text: str):
@@ -55,10 +75,14 @@ class GeminiProvider(LLMProvider):
         config = {"response_mime_type": "application/json"}
         if schema is not None:
             config["response_schema"] = schema
-        resp = self._client.models.generate_content(
-            model=self._model, contents=prompt, config=config
-        )
-        return _normalize(_parse_json(resp.text))
+
+        def _call():
+            resp = self._client.models.generate_content(
+                model=self._model, contents=prompt, config=config
+            )
+            return _normalize(_parse_json(resp.text))
+
+        return _with_retry(_call)
 
 
 class GroqProvider(LLMProvider):
@@ -69,9 +93,12 @@ class GroqProvider(LLMProvider):
         self._model = model
 
     def complete(self, prompt: str, schema: dict | None = None) -> dict:
-        resp = self._client.chat.completions.create(
-            model=self._model,
-            messages=[{"role": "user", "content": prompt}],
-            response_format={"type": "json_object"},
-        )
-        return _normalize(_parse_json(resp.choices[0].message.content))
+        def _call():
+            resp = self._client.chat.completions.create(
+                model=self._model,
+                messages=[{"role": "user", "content": prompt}],
+                response_format={"type": "json_object"},
+            )
+            return _normalize(_parse_json(resp.choices[0].message.content))
+
+        return _with_retry(_call)
