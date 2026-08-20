@@ -13,7 +13,7 @@ Deadline: **2026-08-21, 12:29 PM IST**.
 | M0 — Foundation | **done** | HydraDB running natively, round-trip verified, full P1-P7 probe run live, `docs/cypher-support.md` written, `src/schema/{models.py,ids.py}` committed, license present |
 | M0.5 — TBox frozen | **done** | `ontology/tbox.yaml` (8 classes, 15 relations) validated against all 600 questions (500+100), 0 vocabulary gaps; materialized as `:Class`/`:Relation` nodes, spot-checked live |
 | M1 — Walking skeleton | **done** | Confluence adapter, Tier 1 (chunk+mention), Tier 2 (LLM claim extraction+TBox gate), full anchor→plan→traverse→gate→synthesize LOOKUP path — all verified against live HydraDB + real Gemini/Groq calls. `tests/test_m1_walking_skeleton.py` reproduces it. |
-| M2 — Ingest depth | **done** | All 9 adapters built and validated. Priority tier (812 docs) + stratified fill (25K target, several sources exceeded it) = 64,957 documents ingested, 71,095 MinHash-signed, 254 confirmed near-duplicate pairs. Full real numbers in `docs/coverage.md`. See decisions #28-#36 for everything found along the way. |
+| M2 — Ingest depth | **done, frozen at 244,822 docs** | All 9 adapters built and validated. Priority tier (812 docs) + two stratified-fill passes (25K floor, then 250K floor once SSD storage was available) = **244,822 documents ingested (47.8% of the 511,970-doc corpus), 8 of 9 sources at 100%+ of their 250K-push target** (gmail frozen at 64% — 38,000/59,276 — when build schedule required moving to M3-M7). Full real numbers in `docs/coverage.md`. See decisions #28-#38 for everything found along the way. |
 | M3 — Entity resolution | not started | |
 | M4 — Conflict resolution | not started | |
 | M5 — Query completeness | not started | |
@@ -403,16 +403,60 @@ prose, per the spec's own §0 rule. Each entry: what, why, where it's applied.
     LSH candidate pairs, 254 confirmed (Jaccard ≥ 0.8) — `NEAR_DUPLICATE_OF`
     edges written.
 
+37. **[M2, 250K push] `graph-node` was repeatedly, silently killed by macOS memory
+    pressure — root cause was `GRAPH_DATA_CACHE_BYTES=16GiB` on a machine with only
+    8GiB of physical RAM** (`sysctl hw.memsize` = 8589934592). Confirmed via
+    `sysctl vm.swapusage` showing ~87% of an 8GB swap file in use and `vm_stat`
+    showing only ~86MB of free physical pages at the time of a "silent" graph-node
+    death. This is why the deaths looked clean in `graph-node.log` — no panic, no
+    error, just the log stream stopping mid-operation: a SIGKILL from the kernel's
+    memory-pressure response gives a process no chance to log anything. The 16GiB
+    figure was sized off the SSD's free space (plentiful, 442GB) without checking
+    actual RAM — a real mistake, not a HydraDB issue. **Fix**: restarted with
+    `GRAPH_DATA_CACHE_BYTES=536870912` (512MB) — sane for an 8GB machine that's
+    also running Docker Desktop's VM, this session's own tooling, and the user's
+    other apps concurrently. Two SSD/Docker-adjacent incidents earlier in this
+    same push (an accidental SSD disconnect breaking Docker's bind-mount, and a
+    separate Docker Desktop virtiofs bug misreporting `df` stats inside containers
+    as the *internal* disk's near-full state rather than the SSD's real
+    capacity — fixed by running MinIO natively via Homebrew instead of through
+    Docker, sidestepping the virtualization layer entirely) had already been ruled
+    out as the cause of this specific symptom before RAM was identified as the
+    real one. Three distinct root causes, three distinct fixes, all during the
+    same push — worth remembering as a troubleshooting order for any future
+    "server dies with no error" symptom: connectivity → storage backend → memory.
+
+38. **[M2, freeze decision] With ~14 hours left before the 2026-08-21 12:29 PM IST
+    deadline and M3-M7 entirely unstarted after the machine restart recommended
+    in decision #37, ingest was frozen at 244,822 documents** (97.9% of the
+    250,000-doc push target; 8 of 9 sources at 100%+ of their proportional
+    share, gmail at 64% / 38,000 of 59,276) rather than spending further time
+    resuming gmail toward full target. Reasoning: every source already had
+    substantial cross-representation (smallest source, gmail, still contributed
+    38,000 docs) sufficient for entity resolution, conflict detection, and a
+    credible eval run; the marginal coverage gain from finishing gmail was not
+    worth the time cost (bringing native MinIO/graph-node back up, resuming the
+    retry loop, risk of another stall) against six entirely-unstarted milestones
+    plus README/demo/video prep. `docs/coverage.md` rewritten with final,
+    frozen numbers and this reasoning stated explicitly. Given the same time
+    pressure, the previously-established "stop after each phase for review"
+    workflow is also suspended from M3 onward — phases are committed
+    individually but the build proceeds continuously through M3→M7 rather than
+    waiting for per-phase confirmation.
+
 ## Node/edge counts
 
-As of M2 completion (2026-08-20; full breakdown and methodology in
+As of ingest freeze (2026-08-20; full breakdown and methodology in
 `docs/coverage.md`):
 
-- **Documents**: 64,957 (12.7% of the 511,970-doc corpus — priority tier
-  guaranteed + proportional stratified fill; see decision #35)
-- **MinHash-signed**: 71,095 (some overlap/reprocessing across ingest passes,
-  deduped by doc_id at load time)
-- **NEAR_DUPLICATE_OF edges**: 254 confirmed (257 LSH candidates, Jaccard ≥ 0.8)
+- **Documents**: 244,822 (47.8% of the 511,970-doc corpus — priority tier
+  guaranteed + two stratified-fill passes, 25K then 250K target; see decisions
+  #35, #38)
+- **MinHash-signed / NEAR_DUPLICATE_OF edges**: 71,095 signed / 254 confirmed
+  pairs as of the first M2 dedupe run at 64,957 docs (see decision #36);
+  `dedupe.py` is re-run over the full 244,822-doc corpus as part of M3 (see
+  `docs/coverage.md`'s "Near-duplicate detection" section) since ER
+  corroboration logic depends on current `NEAR_DUPLICATE_OF` edges.
 - Chunk/Mention counts vary per source-mix of what got ingested; not
   re-aggregated here since `MATCH (n:Label) RETURN count(*)` full-label scans
   are slow at this node count without a label/property index (decision #34) —
