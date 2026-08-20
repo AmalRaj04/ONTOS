@@ -1,4 +1,5 @@
-.PHONY: hydradb-up hydradb-down hydradb-minio-up hydradb-indexer-up venv
+.PHONY: hydradb-up hydradb-down hydradb-minio-up hydradb-indexer-up venv \
+	ingest tier2 er conflicts eval serve
 
 VENV := .venv/bin
 
@@ -93,3 +94,24 @@ venv:
 	/Library/Frameworks/Python.framework/Versions/3.12/bin/python3.12 -m venv .venv
 	$(VENV)/pip install --quiet --upgrade pip
 	$(VENV)/pip install --quiet -r requirements.txt
+
+# Pipeline stages, in order (M2-M6). Each is independently resumable/checkpointed —
+# see PROJECT.md decisions for the real numbers/targets used in this build.
+ingest:
+	$(VENV)/python -m src.ingest.run_ingest
+
+tier2:
+	$(VENV)/python -m src.ingest.run_tier2
+
+er:
+	$(VENV)/python -m src.resolution.run_er
+
+conflicts:
+	$(VENV)/python -m src.conflict.run_conflicts
+
+eval:
+	$(VENV)/python -m eval.run_eval
+	$(VENV)/python -m eval.score
+
+serve:
+	$(VENV)/streamlit run ui/app.py

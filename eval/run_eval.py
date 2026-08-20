@@ -117,7 +117,8 @@ def main() -> None:
                 # benchmark's own scorer (which reads question_id/answer/
                 # document_ids), useful for our own error analysis (M6 DoD).
                 "abstained": result["abstained"],
-                "plan_class_path_count": result["traversal"]["path_count"],
+                "plan_class": result["plan_class"],
+                "path_count": result["traversal"]["path_count"],
                 "conflicts": result["conflicts"],
                 "latency_ms": result["graph_stats"]["latency_ms"],
             }

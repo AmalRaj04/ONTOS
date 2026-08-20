@@ -121,6 +121,7 @@ def answer_question(
 
     return {
         "question_id": question_id,
+        "plan_class": plan.plan_class,
         "answer": synthesis["answer"],
         "abstained": False,
         "confidence": round(max_trust, 2),
@@ -152,6 +153,7 @@ def _abstention_response(question_id, plan_class, anchors, reason, start, client
         full_reason += f" (nearest known names: {', '.join(near_misses[:3])})"
     return {
         "question_id": question_id,
+        "plan_class": plan_class,
         "answer": None,
         "abstained": True,
         "confidence": 0.0,

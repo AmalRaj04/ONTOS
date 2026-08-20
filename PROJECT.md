@@ -444,6 +444,103 @@ prose, per the spec's own §0 rule. Each entry: what, why, where it's applied.
     individually but the build proceeds continuously through M3→M7 rather than
     waiting for per-phase confirmation.
 
+39. **[M3] Entity resolution built to run entirely off the local corpus + Tier 1
+    checkpoints, not live graph reads, for candidate gathering.** Same root cause
+    as decision #34: a live `MATCH (n:Document) ...` scan timed out at 240s on
+    the 244,822-doc graph (confirmed live before committing to this approach).
+    `src/resolution/records.py`'s `collect_identity_records()` re-derives
+    `IdentityRecord`s (author_raw + email/handle mentions) directly from each
+    source's already-ingested prefix, using the exact same deterministic
+    `node_id()`/`chunk_body()`/`extract_mentions()` functions Tier 1 used — so
+    the mention IDs it produces are byte-identical to what's already in the
+    graph, and `canonicalize.py`'s `RESOLVES_TO` edges attach to real existing
+    nodes without a lookup round trip. Runs one thread per source
+    (`ThreadPoolExecutor`) since `iter_records()` eagerly lists+sorts every file
+    in a source's directory before yielding anything — at ~500K total corpus
+    files this I/O cost dominates wall time far more than any per-document
+    regex work, and a first single-threaded version of this function was killed
+    after 9+ CPU-minutes with zero sources complete before being parallelized.
+40. **[M3] `cooccurrence_path` (spec: a live `algo.MSpaths pairwise:true` call)
+    implemented as a neighbor-Jaccard proxy in Python instead** — same
+    reasoning as #39. Two identity records' underlying keys (email/handle/
+    normalized name) are compared by the sets of *other* keys they co-occur
+    with across documents; this is the same signal a 2-hop MSpaths pairwise
+    query would surface (shared third-party context), computed in-process.
+    Documented inline in `src/resolution/score.py`.
+41. **[M3] Cross-signal name matching required a compute_features() fix mid-build:**
+    the first version only populated given/surname for plain display-name
+    records, leaving email/handle records with empty name fields — meaning a
+    Jira reporter's display name and an email address for the same person could
+    never share a blocking bucket or score a `name_similarity`/`nickname_link`
+    feature, silently defeating the single most valuable cross-source link this
+    corpus has. Fixed by deriving given/surname for every record kind (email
+    local-part / handle, separators mapped to spaces, in addition to plain
+    names), verified live before scaling up: a synthetic Alice-Patel-vs-
+    alice.patel@redwood.com pair went from a raw score of 0.36 (below even the
+    uncertain-adjudication band) to 0.485 (correctly inside it) once `team_overlap`/
+    `role_consistency` were also given a name-based (not just email-based)
+    fallback lookup against the employee-roster scaffolding.
+42. **[M4] Conflict detection/classification/trust reads Claims from a local
+    `data/claims.jsonl` mirror** (written by `src/ingest/tier2_semantic.py`
+    alongside its normal graph write), not a live `MATCH (c:Claim)` scan — same
+    #34/#39 reasoning, and Claim volume from the bounded Tier 2 sample is small
+    enough to hold in memory directly. Subject resolution goes through
+    `data/er_alias_map.json` (M3's byproduct: normalized alias -> canonical
+    Person id) so two claims naming the same person differently across sources
+    still group into one conflict candidate — this is the mechanism that makes
+    conflict detection actually benefit from entity resolution having run
+    first, which is the M6 ER-ablation's headline comparison.
+43. **[M4] Trust function's authority table applied uniformly, without the
+    spec's suggested per-predicate invert ("invert for 'who's currently on
+    this' type facts")** — not implemented given the build's remaining time;
+    noted directly in `src/conflict/trust.py`'s docstring rather than silently
+    applied as if it were the full spec behavior. `corroboration` and
+    `staleness_penalty` are both real, working, simplified formulas (documented
+    inline) rather than the exact NEAR_DUPLICATE_OF-cluster-collapse the spec
+    describes, for the same time-budget reason.
+44. **[M5] MULTIHOP implemented as a bounded Claim-chain BFS instead of a live
+    `algo.MSpaths` call** — this schema reifies relationships as `Claim` nodes
+    with string subject_id/object_id properties (BUILD-SPEC.md §7.5's frozen
+    model), not as edges directly between resolved entities, so there's no
+    `Person`-to-`Person` edge yet for `MSpaths` to walk. Each BFS hop resolves
+    anchor text through the same `data/er_alias_map.json` anchor.py uses, so
+    the traversal is still entity-resolution-backed, not literal-text-only.
+    Documented in `src/query/traverse.py`'s module docstring and `docs/
+    architecture.md`.
+45. **[M5] `anchor.py`'s M1-era `normalize_surface` now delegates to
+    `src/resolution/normalize.py`'s `normalize_name`** rather than staying a
+    second, separate implementation — the M1 docstring had said M3 would reuse
+    this module, but M3 built its own (richer — soundex, nicknames) module
+    instead; reconciled here so question-side and corpus-side normalization
+    provably can't drift apart, per §11 step 1's actual requirement.
+46. **[M6] `eval/score.py` and `eval/baselines/bm25_baseline.py` reimplement
+    vendor/EnterpriseRAG-Bench's own `metrics_based_eval.py`/`bm25_retrieval.py`
+    rather than importing them directly.** The vendor scripts depend on that
+    repo's own LLM client/env configuration and, for BM25, a running OpenSearch
+    server indexing the full 511,970-document corpus — neither fit the
+    remaining build time. `eval/score.py` uses a single LLM-judge call (Groq)
+    per question instead of the vendor's 3-judge consensus + document-
+    correction flow; `eval/baselines/bm25_baseline.py` uses in-process
+    `rank_bm25` over a bounded corpus subset (the priority tier + Tier 2's
+    stratified sample) instead of full-corpus OpenSearch, for the same memory-
+    safety reason as decision #37 (an 8GB build machine already hit one real
+    OOM incident from an earlier size miscalculation).
+47. **[M4/M5, live spot-checks before scaling up]** Rather than trusting the
+    conflict and query-traversal code from a read-through alone, both were
+    exercised against real data before relying on them for the full run:
+    (a) `detect_conflict_candidates()` / `classify_candidate()` / `adjudicate()`
+    run end-to-end on 3 synthetic STATUS claims for one subject (2 sources
+    agreeing on "delayed", 1 higher-authority source saying "on track") — real
+    Groq call correctly classified it `CONTRADICTION`, and `trust.py` correctly
+    landed on `CONTESTED` (margin 0.03 < 0.12) rather than picking a winner from
+    weak separation; (b) `traverse_multihop()` against two real Claim nodes
+    written directly (`Person -OWNS-> Project -MEMBER_OF-> Team`) correctly
+    found the 2-hop path; `traverse_aggregate()`/`traverse_temporal()`/
+    `traverse_conflict()` (the last against a real `ConflictSet` + `INVOLVES`
+    edge written the same way) all returned correct results on the first try.
+    No bugs found in either pass, but this is what "verified against live
+    HydraDB" means in this log, not an assumption from reading the code.
+
 ## Node/edge counts
 
 As of ingest freeze (2026-08-20; full breakdown and methodology in
